@@ -29,6 +29,8 @@ docker compose up --build
 
 启动后浏览器访问：**http://localhost:8080**
 
+必要配置：`PORT` 环境变量（缺省 `8080`，Compose 已在 `docker-compose.yml` 中设为 `8080` 并映射同名端口）。依赖安装（`npm ci`）随镜像构建完成，拼版计算线程池随服务启动一并初始化，无需额外步骤。
+
 （停止服务：`Ctrl + C`；后台运行：`docker compose up --build -d`；移除容器：`docker compose down`。）
 
 ## 本地开发
@@ -36,8 +38,30 @@ docker compose up --build
 ```bash
 npm install
 npm start          # 启动服务，默认 8080 端口（可用 PORT 环境变量覆盖）
-npm test           # 运行拼版逻辑单元测试
+npm test           # 运行全部测试（拼版逻辑单元测试 + HTTP 接口测试 + 线程池并发行为测试）
 ```
+
+## 并发模型（worker_threads 有界线程池）
+
+`POST /api/impose` 的拼版计算在 **worker_threads 有界线程池**中执行（复用同一套 `computeImposition`），主线程只负责 HTTP 收发，因此**计算期间首页与健康检查接口（`GET /`、`GET /api/health`）照常快速响应**。线程池随服务启动初始化，规则固定：
+
+- **固定 2 个工作线程**，每个线程同一时刻只执行 **1 项**计算；
+- **等待队列**：最多 **8 项**，**先进先出（FIFO）**；
+- **满载**（2 项计算中 + 8 项等待）时，新请求立即返回 **503** 及中文原因；
+- **超时**：每项从**开始执行**起计时，超过 **5 秒**返回 **504**，并**终止、更换**该线程；
+- **线程意外退出**：在算任务返回 **500**，随即**补建线程**，其他任务继续；
+- **每项任务只结算一次**：线程回执携带任务 id，迟到 / 重复消息**不会串到后续请求**；
+- **客户端断开**：等待中的任务直接从队列移除；计算中的任务**终止并补建线程**。
+
+`/api/impose` 状态码汇总：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 计算成功，响应为拼版清单 JSON（与同步计算版本一致） |
+| `400` | 参数错误（`error` 为中文校验信息，与同步计算版本一致） |
+| `503` | 线程池满载（2 项计算中 + 8 项等待），请稍后重试 |
+| `504` | 单项计算超过 5 秒，已终止该任务 |
+| `500` | 计算线程异常退出，请稍后重试 |
 
 ## 拼版规则说明
 
@@ -478,6 +502,8 @@ npm test           # 运行拼版逻辑单元测试
 
 ### `POST /api/impose`
 
+拼版计算在 worker_threads 线程池中异步执行（并发规则、503 / 504 / 500 语义见上文「并发模型」一节）；成功响应与参数错误的 400 响应同同步计算版本完全一致。
+
 请求体：
 
 ```json
@@ -804,7 +830,9 @@ curl -s -X POST http://localhost:8080/api/impose \
 ## 目录结构
 
 ```
-├── server.js            # Express 服务：静态页面 + /api/impose
+├── server.js            # Express 服务：静态页面 + /api/health + /api/impose（经线程池调度）
+├── src/imposePool.js      # worker_threads 有界线程池（2 线程 × 1 项 + 8 项 FIFO 队列、超时更换线程、异常补建、断开取消）
+├── src/imposeWorker.js    # 计算工作线程：复用 computeImposition，回执携带任务 id 保证响应归属
 ├── src/imposition.js      # 拼版计算核心（固定 / 均衡 / 章节优先分帖、正反面页位、翻转坐标变换、爬移补偿 offsetMm）
 ├── src/fitCheck.js        # 纸张规格与出血 / 安全区适配检查（可用矩形、trim/bleed/safe、超限原因）
 ├── src/productionMarks.js # 双面生产标记（裁切线 / 折线标 / 套准十字候选落位、正背坐标变换、省略原因）
@@ -827,6 +855,8 @@ curl -s -X POST http://localhost:8080/api/impose \
 ├── test/dualVersion.test.js
 ├── test/stockBatches.test.js
 ├── test/api.test.js
+├── test/imposePool.test.js        # 线程池并发行为（可控慢任务 / 异常退出 / 排队顺序 / 容量释放 / 响应归属 / 客户端断开）
+├── test/helpers/controllableWorker.js  # 测试用可控工作线程（慢任务 / 异常退出 / 迟到消息模拟）
 ├── Dockerfile
 └── docker-compose.yml
 ```
