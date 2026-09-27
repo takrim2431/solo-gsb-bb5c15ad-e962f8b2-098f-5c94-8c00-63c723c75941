@@ -23,11 +23,18 @@
 
 ## 快速开始（Docker Compose 一键启动）
 
+单条命令完成依赖安装与初始化并启动（本机只需装有 Docker）：
+
 ```bash
 docker compose up --build
 ```
 
 启动后浏览器访问：**http://localhost:8080**
+
+必要配置（`docker-compose.yml` 中可改）：
+
+- `PORT`：监听端口，默认 `8080`（容器内与宿主机映射一致，均为 `8080:8080`）；
+- `IMPOSITION_TIMEOUT_MS`（可选）：单条拼版计算的执行超时毫秒数，缺省 `5000`（5 秒）。
 
 （停止服务：`Ctrl + C`；后台运行：`docker compose up --build -d`；移除容器：`docker compose down`。）
 
@@ -36,8 +43,33 @@ docker compose up --build
 ```bash
 npm install
 npm start          # 启动服务，默认 8080 端口（可用 PORT 环境变量覆盖）
-npm test           # 运行拼版逻辑单元测试
+npm test           # 运行全部测试（拼版逻辑单元测试 + 线程池端到端验证）
 ```
+
+## 计算线程池（/api/impose 并发模型）
+
+拼版计算已迁入 **worker_threads 有界线程池**（`src/impositionPool.js` + `src/impositionWorker.js`），
+复用同一 `computeImposition`，成功结果与参数错误的 400 响应与同步版本完全一致：
+
+- **容量固定**：2 个工作线程，每线程同时只执行 1 项；另有 8 项先进先出（FIFO）等待任务，
+  即最多同时容纳 10 项（2 执行 + 8 等待）；
+- **满载**：第 11 项起的新请求立即返回 **503** 与中文原因（`拼版计算繁忙…队列已满…请稍后重试`）；
+- **执行超时**：每项任务从**开始执行**起计时，超过 5 秒（可用环境变量
+  `IMPOSITION_TIMEOUT_MS` 调整，单位毫秒）返回 **504**，并**终止、更换**该工作线程；
+- **线程意外退出**：当前任务返回 **500**，自动**补建线程**，其他任务与等待队列不受影响；
+- **每项只结算一次**：工作线程消息按任务 id 校验，迟到 / 串号消息一律忽略，不会串到后续请求；
+- **客户端断开**：等待中的任务**移出队列**（释放容量），运行中的任务**终止并补建线程**；
+- 计算期间首页（`/`）与 `GET /api/health` 照常即时响应（计算不占用主线程）。
+
+自动化验证（`test/impositionPool.test.js`，随 `npm test` 运行）借助两个**仅测试环境**的钩子
+（需以 `IMPOSITION_TEST_HOOKS=1` 启动方生效，生产环境自动忽略）：
+
+- 请求体 `__testSlowMs`（正整数）：工作线程计算前忙等该毫秒数，模拟可控慢任务；
+- 请求体 `__testExitWorker`（`before` / `after`）：工作线程在计算前 / 后退出，模拟线程意外退出。
+
+覆盖：成功 / 400 兼容性、计算期间首页与健康接口可响应、满载 503 与中文原因、FIFO 排队顺序、
+响应归属（各请求拿到各自参数的结果）、504 超时终止换线程、500 线程退出补建、
+客户端断开时等待任务移除（容量释放）与运行中任务终止补建。
 
 ## 拼版规则说明
 
@@ -692,6 +724,8 @@ npm test           # 运行拼版逻辑单元测试
 
 参数非法时返回 `400` 与错误信息（含纸张厚度 / 最大补偿量为负，尺寸参数为负、非数字或只提供部分尺寸，`balancedSplit` / `chapterSplit` 非布尔值，两种分帖模式同时启用，章节起始页非数组 / 为空 / 非整数 / 重复 / 未递增 / 越界，观察记录非数组 / 超过 12 条 / 索引越界 / 重复观察 / 字段非法，`productionMarks` 非布尔值、未启用适配检查就开启生产标记、`markSizeMm` 非正数或超过 100mm，备料参数 `materialPrep` 非对象、成品份数 / 每包张数非正整数、开机损耗为负、过程损耗率不在 [0, 1)，采购报价 `purchaseQuotes` 非对象、未启用备料又未给需求张数、报价非数组 / 为空 / 超过 8 条、供应商为空或重复、每包张数非正整数、每包价格（分）为负或非整数、包数边界非法（< 0 / < 1 / 最多少于最少），双版本共版 `dualVersion` 非对象、A / B 版份数非正整数、改动页码缺失 / 为空 / 非整数 / 越界（1 ~ totalPages）/ 区间起点大于终点 / 条目无法解析，以及库存批次领纸 `stockBatches` 非对象、未启用备料就启用本模块、批次非数组 / 为空 / 超过 12 个、批号为空或重复、可用张数非正整数、允许帖号非整数 / 超出帖数范围 / 同批重复等情况）。另提供 `GET /api/health` 健康检查。
 
+计算在 worker_threads 线程池中执行（见上文「计算线程池（/api/impose 并发模型）」一节）：线程池满载（2 项执行中 + 8 项等待已满）时返回 `503` 与中文原因；单项执行超过 5 秒（`IMPOSITION_TIMEOUT_MS` 可调）返回 `504` 并终止、更换该线程；工作线程意外退出时该项返回 `500` 并自动补建线程。
+
 调用示例（生成带双面生产标记的拼版清单，460×330 纸张放 210×297 成品页，短边翻转）：
 
 ```bash
@@ -804,7 +838,9 @@ curl -s -X POST http://localhost:8080/api/impose \
 ## 目录结构
 
 ```
-├── server.js            # Express 服务：静态页面 + /api/impose
+├── server.js            # Express 服务：静态页面 + /api/impose（计算经线程池异步执行）
+├── src/impositionPool.js  # 拼版计算有界线程池（2 线程 + 8 项 FIFO 等待、超时终止换线程、退出补建、断开清理）
+├── src/impositionWorker.js # 工作线程入口（复用 computeImposition；含仅测试环境生效的慢任务 / 异常退出钩子）
 ├── src/imposition.js      # 拼版计算核心（固定 / 均衡 / 章节优先分帖、正反面页位、翻转坐标变换、爬移补偿 offsetMm）
 ├── src/fitCheck.js        # 纸张规格与出血 / 安全区适配检查（可用矩形、trim/bleed/safe、超限原因）
 ├── src/productionMarks.js # 双面生产标记（裁切线 / 折线标 / 套准十字候选落位、正背坐标变换、省略原因）
@@ -827,6 +863,7 @@ curl -s -X POST http://localhost:8080/api/impose \
 ├── test/dualVersion.test.js
 ├── test/stockBatches.test.js
 ├── test/api.test.js
+├── test/impositionPool.test.js # 线程池端到端验证（FIFO / 503 / 504 / 500 / 客户端断开 / 响应归属）
 ├── Dockerfile
 └── docker-compose.yml
 ```

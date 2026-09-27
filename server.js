@@ -2,12 +2,24 @@
 
 const path = require('path');
 const express = require('express');
-const { computeImposition } = require('./src/imposition');
+const { createImpositionPool } = require('./src/impositionPool');
 
 const app = express();
 
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
+
+// 拼版计算迁入有界线程池：固定 2 个工作线程（每线程同时 1 项）+ 8 项 FIFO 等待，
+// 满载（2 + 8 = 10 项）时新请求返回 503；单项执行超过 IMPOSITION_TIMEOUT_MS
+// （默认 5000ms）返回 504 并终止、更换该线程；线程意外退出时该项返回 500 并补建线程。
+const IMPOSE_TIMEOUT_MS = (() => {
+  const parsed = Number(process.env.IMPOSITION_TIMEOUT_MS);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+})();
+const imposePool = createImpositionPool({
+  timeoutMs: IMPOSE_TIMEOUT_MS,
+  testHooks: process.env.IMPOSITION_TEST_HOOKS === '1',
+});
 
 app.get('/api/health', (req, res) => {
   res.json({ ok: true });
@@ -40,13 +52,50 @@ app.get('/api/health', (req, res) => {
  * 各印版印次，以及面数、印版数与总印次汇总）；
  * 启用库存批次领纸时顶层带 stockBatches（各帖需求取自备料需领纸 requiredSheets，
  * 按最大流求总缺口最小的分配：逐帖批次领用明细与缺口、逐批领用合计与剩余张数）。
+ * 计算在工作线程池中异步执行：成功响应与参数错误的 400 响应与同步版本完全一致；
+ * 满载返回 503（中文原因），执行超时返回 504，工作线程意外退出返回 500。
  */
-app.post('/api/impose', (req, res) => {
+app.post('/api/impose', async (req, res) => {
+  const body = req.body || {};
+  let input = body;
+  if (process.env.IMPOSITION_TEST_HOOKS === '1') {
+    // 测试钩子字段（__testSlowMs / __testExitWorker）仅在开启钩子时透传给工作线程
+    input = { ...body };
+    if (!Number.isInteger(input.__testSlowMs) || input.__testSlowMs <= 0) delete input.__testSlowMs;
+    if (input.__testExitWorker !== 'before' && input.__testExitWorker !== 'after') delete input.__testExitWorker;
+  }
+
+  const job = imposePool.submit(input);
+  // 客户端断开（响应未完成前连接关闭）：等待中的任务移出队列（释放容量），
+  // 执行中的任务终止并补建线程。正常响应完成后的 'close' 不处理。
+  res.on('close', () => {
+    if (!res.writableFinished && !res.writableEnded) job.cancel();
+  });
+
+  const outcome = await job.promise;
   try {
-    const result = computeImposition(req.body || {});
-    res.json(result);
+    if (res.writableEnded || res.destroyed) return; // 连接已断开，无需响应
+    switch (outcome.status) {
+      case 'ok':
+        res.json(outcome.result);
+        break;
+      case 'invalid':
+        res.status(400).json({ error: outcome.message });
+        break;
+      case 'rejected':
+        res.status(503).json({ error: '拼版计算繁忙：当前 2 个计算线程均在执行且等待队列已满（8 项），请稍后重试' });
+        break;
+      case 'timeout':
+        res.status(504).json({ error: `拼版计算超时（超过 ${imposePool.timeoutMs}ms），已终止本次计算，请调整参数后重试` });
+        break;
+      case 'crashed':
+        res.status(500).json({ error: '拼版计算线程意外退出，本次计算未完成，请重试' });
+        break;
+      default: // cancelled：客户端已断开，不再响应
+        break;
+    }
   } catch (err) {
-    res.status(400).json({ error: err.message });
+    // 响应写入失败（如客户端在计算完成瞬间断开）：任务已结算，忽略即可
   }
 });
 
@@ -58,9 +107,19 @@ const PORT = Number(process.env.PORT) || 8080;
 
 // 直接运行（node server.js / Docker CMD）时启动服务；被测试 require 时仅导出 app。
 if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`骑马钉拼版预演已启动: http://localhost:${PORT}`);
+  // 初始工作线程全部就绪后再对外服务，避免启动初期请求排队等待线程创建
+  imposePool.ready.then(() => {
+    const server = app.listen(PORT, () => {
+      console.log(`骑马钉拼版预演已启动: http://localhost:${PORT}`);
+    });
+    const shutdown = () => {
+      server.close(() => process.exit(0));
+      imposePool.close().finally(() => process.exit(0));
+      setTimeout(() => process.exit(0), 3000).unref();
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   });
 }
 
-module.exports = { app, PORT };
+module.exports = { app, PORT, imposePool };
